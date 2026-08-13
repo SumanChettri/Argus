@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { createInitialTelemetry, generateNextTelemetry } from '../services/mockDataEngine';
+import { fetchLiveTelemetry, sendControlCommand } from '../services/api';
 import { INITIAL_MISSION, DEFAULT_SENSOR_CONFIG, DEFAULT_NETWORK_CONFIG } from '../utils/constants';
 
 const TelemetryContext = createContext(null);
@@ -7,7 +8,7 @@ const TelemetryContext = createContext(null);
 export const TelemetryProvider = ({ children }) => {
   const [telemetry, setTelemetry] = useState(createInitialTelemetry());
   const [telemetryHistory, setTelemetryHistory] = useState(() => {
-    // Generate 20 initial historical points for crisp immediate charts
+    // Generate initial historical points for chart streams
     const initialHist = [];
     let tempTel = createInitialTelemetry();
     for (let i = 0; i < 25; i++) {
@@ -29,7 +30,7 @@ export const TelemetryProvider = ({ children }) => {
   const [isDemoMode, setIsDemoMode] = useState(true);
   const [isConnected, setIsConnected] = useState(true);
   const [eStopped, setEStopped] = useState(false);
-  const [roverMode, setRoverModeState] = useState('AUTONOMOUS');
+  const [roverMode, setRoverModeState] = useState('MANUAL');
   const [hazardOverride, setHazardOverride] = useState('normal'); // 'normal' | 'warning' | 'critical'
   const [currentMission, setCurrentMission] = useState(INITIAL_MISSION);
   const [sensorConfig, setSensorConfig] = useState(DEFAULT_SENSOR_CONFIG);
@@ -37,46 +38,54 @@ export const TelemetryProvider = ({ children }) => {
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [isSystemHealthOpen, setIsSystemHealthOpen] = useState(false);
   const [isEStopModalOpen, setIsEStopModalOpen] = useState(false);
+  const [lastSeenSecAgo, setLastSeenSecAgo] = useState(0);
 
   // Initial alerts setup
   const [alerts, setAlerts] = useState([
     {
       id: 'alt-101',
       severity: 'info',
-      sensor: 'GPS',
-      message: 'GPS Satellite Lock Acquired (9 Satellites)',
-      timestamp: new Date(Date.now() - 15 * 60 * 1000).toISOString(),
+      sensor: 'System',
+      message: 'ARGUS Command Station Initialized. Toggle LIVE HARDWARE MODE to connect to ESP32.',
+      timestamp: new Date().toISOString(),
       status: 'acknowledged',
-    },
-    {
-      id: 'alt-102',
-      severity: 'warning',
-      sensor: 'Obstacle Sonar',
-      message: 'Obstacle detected 52cm ahead in autonomous path',
-      timestamp: new Date(Date.now() - 4 * 60 * 1000).toISOString(),
-      status: 'new',
     },
   ]);
 
   // Initial mission event logs timeline
   const [logs, setLogs] = useState([
-    { id: 1, timestamp: '14:32:00', event: 'Mission Search & Rescue Alpha started', type: 'info' },
-    { id: 2, timestamp: '14:34:12', event: 'GPS lock acquired (Satellites: 9, Accuracy: 1.2m)', type: 'info' },
-    { id: 3, timestamp: '14:37:45', event: 'Obstacle detected at Waypoint 6, rerouting path', type: 'warning' },
-    { id: 4, timestamp: '14:41:10', event: 'Sensor node scan completed: Gas level safe (124 ppm)', type: 'info' },
+    { id: 1, timestamp: new Date().toLocaleTimeString([], { hour12: false }), event: 'ARGUS Mission Control Portal online', type: 'info' },
   ]);
 
-  // Handle periodic telemetry updates in Demo Mode
+  const addAlert = useCallback((severity, sensor, message) => {
+    const newAlert = {
+      id: `alt-${Date.now()}`,
+      severity,
+      sensor,
+      message,
+      timestamp: new Date().toISOString(),
+      status: 'new',
+    };
+    setAlerts(prev => [newAlert, ...prev]);
+  }, []);
+
+  const addLog = useCallback((event, type = 'info') => {
+    const timeStr = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    setLogs(prev => [{ id: Date.now(), timestamp: timeStr, event, type }, ...prev]);
+  }, []);
+
+  // -----------------------------------------------------------------------------------
+  // 1. DEMO MODE TELEMETRY GENERATOR
+  // -----------------------------------------------------------------------------------
   useEffect(() => {
-    if (!isDemoMode || !isConnected) return;
+    if (!isDemoMode) return;
 
     const interval = setInterval(() => {
       setTelemetry(prev => {
         if (eStopped) {
           return {
             ...prev,
-            motors: { ...prev.motors, leftSpeed: 0, rightSpeed: 0, state: 'STOPPED' },
-            connection: { ...prev.connection, pingMs: 10 + Math.floor(Math.random() * 5) }
+            motors: { ...prev.motors, leftSpeed: 0, rightSpeed: 0, state: 'STOPPED' }
           };
         }
 
@@ -98,42 +107,125 @@ export const TelemetryProvider = ({ children }) => {
           return updated.length > 60 ? updated.slice(updated.length - 60) : updated;
         });
 
-        // Trigger automatic alerts if hazard level escalates
-        if (next.gas.status === 'CRITICAL' && prev.gas.status !== 'CRITICAL') {
-          addAlert('critical', 'Gas Hazard', `CRITICAL: High gas concentration detected (${next.gas.smokePpm} PPM)`);
-          addLog(`CRITICAL HAZARD DETECTED: Gas level ${next.gas.smokePpm} PPM`, 'critical');
-        } else if (next.obstacle.status === 'OBSTACLE DETECTED' && prev.obstacle.status !== 'OBSTACLE DETECTED') {
-          addAlert('warning', 'Sonar Radar', `Obstacle detected ${next.obstacle.frontCm}cm directly ahead`);
-          addLog(`Obstacle auto-avoidance triggered (${next.obstacle.frontCm}cm)`, 'warning');
-        }
-
         return next;
       });
     }, 1200);
 
     return () => clearInterval(interval);
-  }, [isDemoMode, isConnected, eStopped, hazardOverride]);
+  }, [isDemoMode, eStopped, hazardOverride]);
 
-  const addAlert = useCallback((severity, sensor, message) => {
-    const newAlert = {
-      id: `alt-${Date.now()}`,
-      severity,
-      sensor,
-      message,
-      timestamp: new Date().toISOString(),
-      status: 'new',
+  // -----------------------------------------------------------------------------------
+  // 2. LIVE HARDWARE TELEMETRY POLLING (When isDemoMode === false)
+  // -----------------------------------------------------------------------------------
+  useEffect(() => {
+    if (isDemoMode) return;
+
+    const fetchTelemetryFromVercel = async () => {
+      const liveData = await fetchLiveTelemetry();
+      if (!liveData) {
+        setIsConnected(false);
+        return;
+      }
+
+      setIsConnected(liveData.isOnline ?? false);
+      setLastSeenSecAgo(liveData.lastSeenSecAgo ?? 0);
+
+      // Merge real hardware readings with current status schema
+      setTelemetry(prev => {
+        const nextTemp = liveData.temperature?.current ?? prev.temperature.current;
+        const nextHum = liveData.humidity ?? prev.humidity;
+
+        const nextFront = liveData.obstacle?.frontCm ?? null;
+        const nextLeft = liveData.obstacle?.leftCm ?? null;
+        const nextRight = liveData.obstacle?.rightCm ?? null;
+
+        const isOnline = liveData.isOnline ?? false;
+
+        // Auto alerts for real obstacle or temp spike
+        if (isOnline && nextFront !== null && nextFront < 30 && prev.obstacle.frontCm >= 30) {
+          addAlert('critical', 'Front Sonar', `REAL OBSTACLE DETECTED: ${nextFront}cm ahead!`);
+          addLog(`HARDWARE ALERT: Front obstacle detected at ${nextFront}cm`, 'critical');
+        }
+
+        // Push real temp to telemetry chart history
+        if (nextTemp !== null) {
+          setTelemetryHistory(hPrev => {
+            const newPoint = {
+              time: new Date().toLocaleTimeString([], { hour12: false, minute: '2-digit', second: '2-digit' }),
+              battery: prev.battery.percentage ?? 0,
+              voltage: prev.battery.voltage ?? 0,
+              temperature: nextTemp,
+              humidity: nextHum ?? 0,
+              gas: 0,
+              signal: liveData.connection?.signalPercentage ?? 0,
+              speed: 0,
+            };
+            const updated = [...hPrev, newPoint];
+            return updated.length > 60 ? updated.slice(updated.length - 60) : updated;
+          });
+        }
+
+        return {
+          ...prev,
+          roverId: liveData.roverId || "ARGUS-01",
+          temperature: {
+            current: nextTemp !== null ? parseFloat(nextTemp.toFixed(1)) : "N/A",
+            min: liveData.temperature?.min ?? "N/A",
+            max: liveData.temperature?.max ?? "N/A",
+            unit: "°C",
+            trend: "stable",
+            status: liveData.temperature?.status || "connected"
+          },
+          humidity: nextHum !== null ? parseFloat(nextHum.toFixed(1)) : "N/A",
+          obstacle: {
+            frontCm: nextFront,
+            leftCm: nextLeft,
+            rightCm: nextRight,
+            rearCm: null, // Hardware not connected for rear sonar
+            status: liveData.obstacle?.status || (isOnline ? "SAFE DISTANCE" : "OFFLINE"),
+            detected: liveData.obstacle?.detected || false
+          },
+          connection: {
+            status: isOnline ? "connected" : "offline",
+            type: "Wi-Fi 2.4GHz (STA)",
+            signalDbm: liveData.connection?.signalDbm ?? -100,
+            signalPercentage: liveData.connection?.signalPercentage ?? 0,
+            pingMs: 14,
+            packetsReceived: prev.connection.packetsReceived + 1,
+            packetsLost: isOnline ? prev.connection.packetsLost : prev.connection.packetsLost + 1
+          },
+          gas: {
+            value: null,
+            smokePpm: "N/A",
+            lpgPpm: "N/A",
+            coPpm: "N/A",
+            methanePpm: "N/A",
+            status: "SAFE",
+            sensorState: "Hardware Not Connected"
+          },
+          gps: {
+            ...prev.gps,
+            lock: false,
+            satellites: 0
+          },
+          motors: {
+            ...prev.motors,
+            state: "STOPPED",
+            mode: "MANUAL"
+          }
+        };
+      });
     };
-    setAlerts(prev => [newAlert, ...prev]);
-  }, []);
 
-  const addLog = useCallback((event, type = 'info') => {
-    const timeStr = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    setLogs(prev => [{ id: Date.now(), timestamp: timeStr, event, type }, ...prev]);
-  }, []);
+    fetchTelemetryFromVercel();
+    const interval = setInterval(fetchTelemetryFromVercel, 1200);
+    return () => clearInterval(interval);
+  }, [isDemoMode, addAlert, addLog]);
 
   // Emergency Stop Handler
   const triggerEmergencyStop = useCallback(() => {
     setEStopped(true);
+    sendControlCommand({ command: 'ESTOP' });
     setTelemetry(prev => ({
       ...prev,
       motors: { ...prev.motors, leftSpeed: 0, rightSpeed: 0, state: 'STOPPED' }
@@ -144,6 +236,7 @@ export const TelemetryProvider = ({ children }) => {
 
   const resetEmergencyStop = useCallback(() => {
     setEStopped(false);
+    sendControlCommand({ command: 'CLEAR_ESTOP' });
     setTelemetry(prev => ({
       ...prev,
       motors: { ...prev.motors, state: 'FORWARD', leftSpeed: 60, rightSpeed: 60 }
@@ -152,37 +245,26 @@ export const TelemetryProvider = ({ children }) => {
     addLog('Emergency stop cleared by operator', 'info');
   }, [addAlert, addLog]);
 
-  // Movement commands
+  // Drive Commands
   const sendDriveCommand = useCallback((direction, speed = 70) => {
     if (eStopped) return;
     setRoverModeState('MANUAL');
-    let stateStr = 'FORWARD';
+    sendControlCommand({ command: 'DRIVE', direction, speed });
+
+    let stateStr = direction;
     let lSpeed = speed;
     let rSpeed = speed;
 
-    switch (direction) {
-      case 'FORWARD':
-        stateStr = 'FORWARD';
-        break;
-      case 'REVERSE':
-        stateStr = 'REVERSE';
-        break;
-      case 'LEFT':
-        stateStr = 'TURNING_LEFT';
-        lSpeed = Math.round(speed * 0.3);
-        rSpeed = speed;
-        break;
-      case 'RIGHT':
-        stateStr = 'TURNING_RIGHT';
-        lSpeed = speed;
-        rSpeed = Math.round(speed * 0.3);
-        break;
-      case 'STOP':
-      default:
-        stateStr = 'STOPPED';
-        lSpeed = 0;
-        rSpeed = 0;
-        break;
+    if (direction === 'LEFT') {
+      stateStr = 'TURNING_LEFT';
+      lSpeed = Math.round(speed * 0.3);
+    } else if (direction === 'RIGHT') {
+      stateStr = 'TURNING_RIGHT';
+      rSpeed = Math.round(speed * 0.3);
+    } else if (direction === 'STOP') {
+      stateStr = 'STOPPED';
+      lSpeed = 0;
+      rSpeed = 0;
     }
 
     setTelemetry(prev => ({
@@ -200,6 +282,7 @@ export const TelemetryProvider = ({ children }) => {
 
   const setRoverMode = useCallback((mode) => {
     setRoverModeState(mode);
+    sendControlCommand({ command: 'SET_MODE', mode });
     setTelemetry(prev => ({
       ...prev,
       motors: { ...prev.motors, mode }
@@ -250,6 +333,7 @@ export const TelemetryProvider = ({ children }) => {
         setIsSystemHealthOpen,
         isEStopModalOpen,
         setIsEStopModalOpen,
+        lastSeenSecAgo,
       }}
     >
       {children}

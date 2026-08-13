@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# ESP32 Secrets Config
+testcodeesp/config.h
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
